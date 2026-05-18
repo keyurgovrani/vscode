@@ -23,6 +23,7 @@ import { inlineMeta } from './lib/inlineMeta.ts';
 import packageJson from '../package.json' with { type: 'json' };
 import product from '../product.json' with { type: 'json' };
 import * as crypto from 'crypto';
+import * as cp from 'child_process';
 import * as i18n from './lib/i18n.ts';
 import { getProductionDependencies } from './lib/dependencies.ts';
 import { config } from './lib/electron.ts';
@@ -521,6 +522,37 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 	return task;
 }
 
+function runSigntoolRemove(flag: '/u' | '/s', filePath: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const proc = cp.spawn('signtool.exe', ['remove', flag, '/q', filePath]);
+		let out = '';
+		proc.stdout?.on('data', chunk => out += chunk.toString());
+		proc.stderr?.on('data', chunk => out += chunk.toString());
+		proc.on('error', reject);
+		proc.on('exit', code => {
+			if (code === 0 || /No signatures were found/i.test(out)) {
+				resolve();
+			} else {
+				process.stderr.write(out);
+				reject(new Error(`signtool remove ${flag} failed for ${filePath} (exit ${code})`));
+			}
+		});
+	});
+}
+
+async function stripAuthenticodeSignature(filePath: string): Promise<void> {
+	// ESRP's `signtool /as` (append) fails with 0x800700C1 on PEs whose existing
+	// Authenticode signature was invalidated by rcedit. Strip cleanly first so
+	// rcedit operates on an unsigned PE.
+	//
+	// signtool rejects `/u` and `/s` in the same invocation, so run them
+	// sequentially: `/u` first to strip unauthenticated attributes (where
+	// nested/dual signatures live on binaries like msal-node-runtime.node),
+	// then `/s` to remove the primary signature entirely.
+	await runSigntoolRemove('/u', filePath);
+	await runSigntoolRemove('/s', filePath);
+}
+
 function patchWin32DependenciesTask(destinationFolderName: string) {
 	const cwd = path.join(path.dirname(root), destinationFolderName);
 
@@ -537,8 +569,10 @@ function patchWin32DependenciesTask(destinationFolderName: string) {
 
 		const patchPromises = deps.map<Promise<unknown>>(async dep => {
 			const basename = path.basename(dep);
+			const fullPath = path.join(cwd, dep);
 
-			await rcedit(path.join(cwd, dep), {
+			await stripAuthenticodeSignature(fullPath);
+			await rcedit(fullPath, {
 				'file-version': baseVersion,
 				'version-string': {
 					'CompanyName': 'Microsoft Corporation',
